@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template for test-agents deployment with EC2, Lambda, S3, IAM, Secrets Manager, and Glue'
+Description: 'CloudFormation template for test-agents S3 bucket (testing deployment)'
 
 Parameters:
   Environment:
@@ -11,75 +11,12 @@ Parameters:
       - prod
     Description: Environment name
   
-  InstanceType:
-    Type: String
-    Default: t3.micro
-    Description: EC2 instance type
-  
   S3BucketName:
     Type: String
     Description: S3 bucket name for application data
     Default: test-agents-artifacts-529088291603
 
 Resources:
-  # ===== IAM Role for EC2 and Lambda =====
-  EC2LambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'test-agents-${Environment}-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - ec2.amazonaws.com
-                - lambda.amazonaws.com
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
-      Policies:
-        - PolicyName: S3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 's3:GetObject'
-                  - 's3:PutObject'
-                  - 's3:ListBucket'
-                Resource:
-                  - !Sub 'arn:aws:s3:::${S3Bucket}'
-                  - !Sub 'arn:aws:s3:::${S3Bucket}/*'
-        - PolicyName: SecretsManagerAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'secretsmanager:GetSecretValue'
-                  - 'secretsmanager:DescribeSecret'
-                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:test-agents/*'
-        - PolicyName: GlueAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 'glue:GetDatabase'
-                  - 'glue:GetTable'
-                  - 'glue:GetTables'
-                  - 'glue:StartJobRun'
-                  - 'glue:GetJobRun'
-                Resource: '*'
-
-  # ===== EC2 Instance Profile =====
-  EC2InstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      Roles:
-        - !Ref EC2LambdaRole
-
   # ===== S3 Bucket =====
   S3Bucket:
     Type: AWS::S3::Bucket
@@ -114,199 +51,6 @@ Resources:
               StringNotEquals:
                 's3:x-amz-server-side-encryption': AES256
 
-  # ===== Secrets Manager =====
-  TestAgentsSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: test-agents/prod/credentials
-      Description: Credentials for test-agents application
-      SecretString: |
-        {
-          "username": "admin",
-          "password": "ChangeMe123!",
-          "database_host": "localhost",
-          "database_port": "5432"
-        }
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ===== Lambda Execution Role =====
-  LambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'test-agents-lambda-${Environment}-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-      Policies:
-        - PolicyName: LambdaS3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 's3:GetObject'
-                  - 's3:PutObject'
-                Resource: !Sub '${S3Bucket.Arn}/*'
-
-  # ===== Lambda Function =====
-  TestAgentsLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub 'test-agents-${Environment}'
-      Runtime: python3.11
-      Handler: index.handler
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 60
-      Environment:
-        Variables:
-          ENVIRONMENT: !Ref Environment
-          S3_BUCKET: !Ref S3Bucket
-          SECRET_NAME: !Ref TestAgentsSecret
-      Code:
-        ZipFile: |
-          import json
-          import boto3
-          import os
-          
-          def handler(event, context):
-              environment = os.environ.get('ENVIRONMENT', 'prod')
-              s3_bucket = os.environ.get('S3_BUCKET', '')
-              
-              return {
-                  'statusCode': 200,
-                  'body': json.dumps({
-                      'message': 'Test Agents Lambda Function',
-                      'environment': environment,
-                      's3_bucket': s3_bucket
-                  })
-              }
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ===== EC2 Security Group =====
-  EC2SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupName: !Sub 'test-agents-${Environment}-sg'
-      GroupDescription: Security group for test-agents EC2 instances
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
-          Description: SSH access
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-          Description: HTTP access
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS access
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
-          Description: Allow all outbound traffic
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ===== EC2 Instance =====
-  EC2Instance:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI for us-east-1
-      InstanceType: !Ref InstanceType
-      IamInstanceProfile: !Ref EC2InstanceProfile
-      SecurityGroupIds:
-        - !Ref EC2SecurityGroup
-      UserData:
-        Fn::Base64: |
-          #!/bin/bash
-          yum update -y
-          yum install -y python3 python3-pip git
-          pip3 install boto3 awscli
-          
-          # Log the startup
-          echo "Test-agents EC2 instance started successfully" >> /var/log/user-data.log
-          
-          # Create application directory
-          mkdir -p /opt/test-agents
-          cd /opt/test-agents
-          
-          # Clone repository (example)
-          # git clone https://github.com/chaitu67/test-agents.git .
-          
-          # Install application dependencies
-          # pip3 install -r requirements.txt
-      Tags:
-        - Key: Name
-          Value: !Sub 'test-agents-${Environment}-instance'
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ===== Glue Database =====
-  GlueDatabase:
-    Type: AWS::Glue::Database
-    Properties:
-      CatalogId: !Ref AWS::AccountId
-      DatabaseInput:
-        Name: !Sub 'test_agents_${Environment}'
-        Description: Glue database for test-agents data processing
-
-  # ===== Glue IAM Role for Jobs =====
-  GlueJobRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'test-agents-glue-${Environment}-role'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: glue.amazonaws.com
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
-      Policies:
-        - PolicyName: GlueS3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - 's3:GetObject'
-                  - 's3:PutObject'
-                  - 's3:ListBucket'
-                Resource:
-                  - !Sub '${S3Bucket.Arn}'
-                  - !Sub '${S3Bucket.Arn}/*'
-
-  # ===== CloudWatch Log Group for Lambda =====
-  LambdaLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/test-agents-${Environment}'
-      RetentionInDays: 30
-
-  # ===== CloudWatch Log Group for EC2 =====
-  EC2LogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/ec2/test-agents-${Environment}'
-      RetentionInDays: 30
-
 Outputs:
   S3BucketName:
     Description: Name of the S3 bucket
@@ -314,26 +58,8 @@ Outputs:
     Export:
       Name: !Sub 'test-agents-${Environment}-S3Bucket'
 
-  LambdaFunctionArn:
-    Description: ARN of the Lambda function
-    Value: !GetAtt TestAgentsLambda.Arn
+  S3BucketArn:
+    Description: ARN of the S3 bucket
+    Value: !GetAtt S3Bucket.Arn
     Export:
-      Name: !Sub 'test-agents-${Environment}-LambdaArn'
-
-  EC2InstanceId:
-    Description: EC2 Instance ID
-    Value: !Ref EC2Instance
-    Export:
-      Name: !Sub 'test-agents-${Environment}-InstanceId'
-
-  GlueDatabaseName:
-    Description: Glue Database Name
-    Value: !Ref GlueDatabase
-    Export:
-      Name: !Sub 'test-agents-${Environment}-GlueDB'
-
-  SecretArn:
-    Description: ARN of the Secrets Manager secret
-    Value: !Ref TestAgentsSecret
-    Export:
-      Name: !Sub 'test-agents-${Environment}-Secret'
+      Name: !Sub 'test-agents-${Environment}-S3BucketArn'
