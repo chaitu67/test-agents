@@ -1,0 +1,122 @@
+name: Destroy AWS Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack_name:
+        description: 'CloudFormation stack name to delete'
+        required: true
+        default: 'test-agents-stack'
+        type: string
+      confirm:
+        description: 'Type "yes" to confirm deletion'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  destroy:
+    name: Delete CloudFormation Stack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Confirm Deletion
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "yes" ]; then
+            echo "❌ Deletion cancelled. You must type 'yes' to confirm."
+            exit 1
+          fi
+          echo "✅ Deletion confirmed. Proceeding with stack deletion..."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check if stack exists
+        id: check-stack
+        run: |
+          if aws cloudformation describe-stacks \
+              --stack-name ${{ github.event.inputs.stack_name }} \
+              --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "stack-exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Stack found: ${{ github.event.inputs.stack_name }}"
+          else
+            echo "stack-exists=false" >> $GITHUB_OUTPUT
+            echo "❌ Stack not found: ${{ github.event.inputs.stack_name }}"
+            exit 1
+          fi
+
+      - name: Empty S3 Buckets (if any)
+        if: steps.check-stack.outputs.stack-exists == 'true'
+        run: |
+          echo "🗑️  Emptying S3 buckets from stack..."
+          
+          # Get bucket names from stack resources
+          BUCKETS=$(aws cloudformation describe-stack-resources \
+            --stack-name ${{ github.event.inputs.stack_name }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "StackResources[?ResourceType=='AWS::S3::Bucket'].PhysicalResourceId" \
+            --output text)
+          
+          if [ -z "$BUCKETS" ]; then
+            echo "ℹ️  No S3 buckets found in stack"
+          else
+            for BUCKET in $BUCKETS; do
+              echo "Emptying bucket: $BUCKET"
+              aws s3 rm "s3://$BUCKET" --recursive --region ${{ env.AWS_REGION }} || true
+              echo "✅ Bucket emptied: $BUCKET"
+            done
+          fi
+
+      - name: Delete CloudFormation Stack
+        if: steps.check-stack.outputs.stack-exists == 'true'
+        run: |
+          echo "🔥 Deleting CloudFormation stack: ${{ github.event.inputs.stack_name }}"
+          
+          aws cloudformation delete-stack \
+            --stack-name ${{ github.event.inputs.stack_name }} \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "⏳ Waiting for stack deletion to complete (this may take a few minutes)..."
+          
+          aws cloudformation wait stack-delete-complete \
+            --stack-name ${{ github.event.inputs.stack_name }} \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ Stack deleted successfully!"
+
+      - name: Verify Deletion
+        if: steps.check-stack.outputs.stack-exists == 'true'
+        run: |
+          echo "🔍 Verifying stack deletion..."
+          
+          if aws cloudformation describe-stacks \
+              --stack-name ${{ github.event.inputs.stack_name }} \
+              --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "⚠️  Stack still exists (may be in DELETE_IN_PROGRESS state)"
+          else
+            echo "✅ Stack deletion verified - stack no longer exists"
+          fi
+
+      - name: Send Deletion Notification
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = "${{ job.status }}" === "success" ? "✅ Successfully deleted" : "❌ Failed to delete";
+            github.rest.issues.createComment({
+              issue_number: context.issue.number || 0,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${status} CloudFormation stack: **${{ github.event.inputs.stack_name }}**\n\nRegion: \`${{ env.AWS_REGION }}\`\n\nWorkflow: [${context.workflow}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+            }).catch(e => console.log('Not on a PR, skipping notification'))
